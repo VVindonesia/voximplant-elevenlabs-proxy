@@ -168,16 +168,17 @@ app.post('/tts/elevenlabs', async (req, res) => {
         // Добавляем случайные задержки для имитации человека
         await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 1000));
 
-        console.log('Making request to Eleven Labs via internal proxy...');
+        console.log('Making request to Eleven Labs directly...');
 
-        // Используем наш внутренний прокси на порту 3001
+        // Прямой запрос к Eleven Labs API
         const response = await axios({
             method: 'POST',
-            url: `http://localhost:3001/api/v1/text-to-speech/${voice_id}`,
+            url: `https://api.elevenlabs.io/v1/text-to-speech/${voice_id}`,
             headers: {
                 'Accept': 'audio/mpeg',
                 'Content-Type': 'application/json',
-                'xi-api-key': process.env.ELEVEN_API_KEY
+                'xi-api-key': process.env.ELEVEN_API_KEY,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             data: {
                 text: text,
