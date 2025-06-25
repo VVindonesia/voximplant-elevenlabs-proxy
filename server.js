@@ -1,260 +1,385 @@
-// ГОЛОСОВОЙ AI АССИСТЕНТ С GROQ
-// Voximplant + STT + Groq LLM + ElevenLabs TTS
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors');
+const helmet = require('helmet');
+const { exec } = require('child_process');
 
-// Настройки сервисов
-const CONFIG = {
-    TTS_SERVER: 'https://voximplant-elevenlabs-proxy.onrender.com',
-    GROQ_API: 'https://api.groq.com/openai/v1/chat/completions',
-    GROQ_MODEL: 'llama-3.1-70b-versatile', // Быстрая модель
-    // Альтернативы: 'mixtral-8x7b-32768', 'llama-3.1-8b-instant'
-};
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Главный обработчик звонков
-VoxEngine.addEventListener(AppEvents.CallAlerting, (e) => {
-    Logger.write("🔥 Новый звонок от: " + e.call.number());
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use('/audio', express.static('public'));
+
+// Создаем папку для аудио файлов
+if (!fs.existsSync('public')) {
+    fs.mkdirSync('public');
+}
+
+// Edge TTS endpoint (бесплатный Microsoft TTS)
+app.post('/tts/edge', async (req, res) => {
+    try {
+        const { text, voice = 'en-US-AriaNeural', rate = '0%', pitch = '0Hz' } = req.body;
+        
+        if (!text) {
+            return res.status(400).json({ error: 'Text is required' });
+        }
+
+        console.log('Generating speech with Edge TTS...');
+        
+        // Создаем уникальное имя файла
+        const filename = `tts_edge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.mp3`;
+        const filepath = path.join(__dirname, 'public', filename);
+        
+        // Используем edge-tts команду
+        const command = `echo "${text.replace(/"/g, '\\"')}" | edge-tts --voice "${voice}" --rate="${rate}" --pitch="${pitch}" --write-media "${filepath}"`;
+        
+        await new Promise((resolve, reject) => {
+            exec(command, (error, stdout, stderr) => {
+                if (error) {
+                    console.error('Edge TTS Error:', error);
+                    reject(error);
+                } else {
+                    resolve();
+                }
+            });
+        });
+
+        // Проверяем, что файл создался
+        if (!fs.existsSync(filepath)) {
+            throw new Error('Failed to generate audio file');
+        }
+
+        // Возвращаем URL
+        const audioUrl = `https://${req.get('host')}/audio/${filename}`;
+        
+        res.json({ 
+            success: true,
+            url: audioUrl,
+            filename: filename,
+            provider: 'edge-tts'
+        });
+
+        // Удаляем файл через 10 минут
+        setTimeout(() => {
+            fs.unlink(filepath, (err) => {
+                if (err) console.error('Error deleting file:', err);
+            });
+        }, 10 * 60 * 1000);
+
+    } catch (error) {
+        console.error('Edge TTS Error:', error);
+        res.status(500).json({ 
+            error: 'Edge TTS generation failed',
+            details: error.message
+        });
+    }
+});
+
+// OpenAI TTS endpoint
+app.post('/tts/openai', async (req, res) => {
+    try {
+        const { text, voice = 'alloy', model = 'tts-1' } = req.body;
+        
+        if (!text) {
+            return res.status(400).json({ error: 'Text is required' });
+        }
+
+        if (!process.env.OPENAI_API_KEY) {
+            return res.status(500).json({ error: 'OPENAI_API_KEY not configured' });
+        }
+
+        console.log('Making request to OpenAI TTS...');
+        
+        const response = await axios({
+            method: 'POST',
+            url: 'https://api.openai.com/v1/audio/speech',
+            headers: {
+                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            data: {
+                model: model,
+                input: text,
+                voice: voice,
+                response_format: 'mp3'
+            },
+            responseType: 'arraybuffer',
+            timeout: 30000
+        });
+
+        const filename = `tts_openai_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.mp3`;
+        const filepath = path.join(__dirname, 'public', filename);
+        
+        fs.writeFileSync(filepath, response.data);
+
+        const audioUrl = `https://${req.get('host')}/audio/${filename}`;
+        
+        res.json({ 
+            success: true,
+            url: audioUrl,
+            filename: filename,
+            provider: 'openai'
+        });
+
+        setTimeout(() => {
+            fs.unlink(filepath, (err) => {
+                if (err) console.error('Error deleting file:', err);
+            });
+        }, 10 * 60 * 1000);
+
+    } catch (error) {
+        console.error('OpenAI TTS Error:', error.response?.data || error.message);
+        res.status(500).json({ 
+            error: 'OpenAI TTS generation failed',
+            details: error.response?.data || error.message
+        });
+    }
+});
+
+// ElevenLabs TTS endpoint
+app.post('/tts/elevenlabs', async (req, res) => {
+    try {
+        const { text, voice_id = 'pNInz6obpgDQGcFmaJgB' } = req.body;
+        
+        if (!text) {
+            return res.status(400).json({ error: 'Text is required' });
+        }
+
+        if (!process.env.ELEVEN_API_KEY) {
+            return res.status(500).json({ error: 'ELEVEN_API_KEY not configured' });
+        }
+
+        // Массив разных User-Agent для маскировки
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
+        ];
+
+        const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
+        
+        // Добавляем случайные задержки для имитации человека
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 1000));
+
+        console.log('Making request to Eleven Labs directly...');
+
+        // Прямой запрос к Eleven Labs API
+        const response = await axios({
+            method: 'POST',
+            url: `https://api.elevenlabs.io/v1/text-to-speech/${voice_id}`,
+            headers: {
+                'Accept': 'audio/mpeg',
+                'Content-Type': 'application/json',
+                'xi-api-key': process.env.ELEVEN_API_KEY,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            data: {
+                text: text,
+                model_id: 'eleven_monolingual_v1',
+                voice_settings: {
+                    stability: 0.5,
+                    similarity_boost: 0.5
+                }
+            },
+            responseType: 'arraybuffer',
+            timeout: 30000
+        });
+
+        const filename = `tts_eleven_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.mp3`;
+        const filepath = path.join(__dirname, 'public', filename);
+        
+        fs.writeFileSync(filepath, response.data);
+
+        const audioUrl = `https://${req.get('host')}/audio/${filename}`;
+        
+        res.json({ 
+            success: true,
+            url: audioUrl,
+            filename: filename,
+            provider: 'elevenlabs'
+        });
+
+        setTimeout(() => {
+            fs.unlink(filepath, (err) => {
+                if (err) console.error('Error deleting file:', err);
+            });
+        }, 10 * 60 * 1000);
+
+    } catch (error) {
+        console.error('ElevenLabs TTS Error:', error.response?.data || error.message);
+        res.status(500).json({ 
+            error: 'ElevenLabs TTS generation failed',
+            details: error.response?.data || error.message
+        });
+    }
+});
+
+// Универсальный TTS endpoint
+app.post('/tts', async (req, res) => {
+    const { text, provider = 'auto', voice } = req.body;
     
-    e.call.answer();
+    if (!text) {
+        return res.status(400).json({ error: 'Text is required' });
+    }
+
+    // Автоматический выбор: Edge TTS (всегда работает) > OpenAI > ElevenLabs
+    let selectedProvider = provider;
+    if (provider === 'auto') {
+        selectedProvider = 'edge';  // Edge TTS как приоритет
+    }
+
+    console.log(`Using TTS provider: ${selectedProvider}`);
+
+    try {
+        if (selectedProvider === 'edge') {
+            return await edgeTTSHandler(req, res);
+        } else if (selectedProvider === 'openai' && process.env.OPENAI_API_KEY) {
+            return await openaiTTSHandler(req, res);
+        } else if (selectedProvider === 'elevenlabs' && process.env.ELEVEN_API_KEY) {
+            // Eleven Labs заблокирован в Турции, возвращаем ошибку
+            return res.status(503).json({ 
+                error: 'ElevenLabs not available from this region',
+                suggestion: 'Use Edge TTS instead'
+            });
+        } else {
+            return res.status(400).json({ error: 'No valid TTS provider available' });
+        }
+    } catch (error) {
+        console.error('TTS routing error:', error);
+        res.status(500).json({ error: 'TTS routing failed', details: error.message });
+    }
+});
+
+// Вспомогательные функции для обработки
+async function edgeTTSHandler(req, res) {
+    const { text, voice = 'en-US-AriaNeural' } = req.body;
     
-    // Контекст беседы для каждого звонящего
-    const conversationContext = {
-        messages: [
-            {
-                role: "system", 
-                content: `Ты профессиональный телефонный помощник российской IT компании. 
-                
-                Правила:
-                - Отвечай КРАТКО (максимум 2-3 предложения)
-                - Говори естественно, как живой человек
-                - Если не знаешь ответ - честно скажи об этом
-                - Будь вежливым но не заискивающим
-                - Помогай решать вопросы клиентов
-                
-                Информация о компании:
-                - Занимаемся разработкой ПО и IT-консалтингом
-                - Работаем пн-пт с 9 до 18
-                - Есть техподдержка и отдел продаж`
-            }
+    try {
+        const filename = `tts_edge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.mp3`;
+        const filepath = path.join(__dirname, 'public', filename);
+        
+        const command = `echo "${text.replace(/"/g, '\\"')}" | edge-tts --voice "${voice}" --write-media "${filepath}"`;
+        
+        await new Promise((resolve, reject) => {
+            exec(command, (error) => {
+                if (error) reject(error);
+                else resolve();
+            });
+        });
+
+        if (!fs.existsSync(filepath)) {
+            throw new Error('Failed to generate audio file');
+        }
+
+        const audioUrl = `https://${req.get('host')}/audio/${filename}`;
+        
+        res.json({ 
+            success: true,
+            url: audioUrl,
+            filename: filename,
+            provider: 'edge-tts'
+        });
+
+        setTimeout(() => {
+            fs.unlink(filepath, (err) => {
+                if (err) console.error('Error deleting file:', err);
+            });
+        }, 10 * 60 * 1000);
+
+    } catch (error) {
+        throw error;
+    }
+}
+
+async function openaiTTSHandler(req, res) {
+    // Реализация OpenAI (аналогично выше)
+    throw new Error('OpenAI handler not implemented in routing');
+}
+
+async function elevenLabsTTSHandler(req, res) {
+    // Реализация ElevenLabs (аналогично выше)
+    throw new Error('ElevenLabs handler not implemented in routing');
+}
+
+// Health check
+app.get('/health', (req, res) => {
+    const providers = ['edge-tts']; // Edge TTS всегда доступен
+    if (process.env.OPENAI_API_KEY) providers.push('openai');
+    if (process.env.ELEVEN_API_KEY) providers.push('elevenlabs');
+    
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        providers: providers,
+        default: 'edge-tts'
+    });
+});
+
+// Список доступных голосов
+app.get('/voices', (req, res) => {
+    const voices = {
+        'edge-tts': [
+            { id: 'en-US-AriaNeural', name: 'Aria (English US)', gender: 'female' },
+            { id: 'en-US-JennyNeural', name: 'Jenny (English US)', gender: 'female' },
+            { id: 'en-US-GuyNeural', name: 'Guy (English US)', gender: 'male' },
+            { id: 'en-GB-SoniaNeural', name: 'Sonia (English UK)', gender: 'female' },
+            { id: 'ru-RU-SvetlanaNeural', name: 'Svetlana (Russian)', gender: 'female' }
         ],
-        phoneNumber: e.call.number(),
-        callStartTime: new Date()
+        openai: [
+            { id: 'alloy', name: 'Alloy', gender: 'neutral' },
+            { id: 'echo', name: 'Echo', gender: 'male' },
+            { id: 'fable', name: 'Fable', gender: 'male' },
+            { id: 'onyx', name: 'Onyx', gender: 'male' },
+            { id: 'nova', name: 'Nova', gender: 'female' },
+            { id: 'shimmer', name: 'Shimmer', gender: 'female' }
+        ],
+        elevenlabs: [
+            { id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam', gender: 'male' },
+            { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella', gender: 'female' },
+            { id: 'VR6AewLTigWG4xSOukaG', name: 'Antoni', gender: 'male' }
+        ]
     };
     
-    e.call.addEventListener(CallEvents.Connected, async () => {
-        Logger.write("✅ Звонок подключен, запускаем Groq AI ассистента");
-        
-        // Приветствие
-        await speakToUser(e.call, "Здравствуйте! Меня зовут Алиса, я AI помощник нашей компании. Как дела? Чем могу помочь?");
-        
-        // Запускаем диалог
-        startConversation(e.call, conversationContext);
-    });
-    
-    e.call.addEventListener(CallEvents.Disconnected, () => {
-        Logger.write("📞 Звонок завершен. Длительность: " + 
-            Math.round((new Date() - conversationContext.callStartTime) / 1000) + " сек");
-    });
+    res.json(voices);
 });
 
-// Функция TTS через ElevenLabs
-async function speakToUser(call, text) {
-    Logger.write("🗣️ AI говорит: " + text);
-    
+// Добавить в конец файла server.js перед app.listen()
+app.post('/chat', async (req, res) => {
     try {
-        const response = await Net.httpRequestAsync(CONFIG.TTS_SERVER + '/tts', {
+        const { messages } = req.body;
+        
+        const response = await axios({
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            postData: JSON.stringify({
-                text: text,
-                provider: 'elevenlabs'
-            }),
-            timeout: 15000
-        });
-        
-        if (response.code === 200) {
-            const result = JSON.parse(response.text);
-            if (result.success && result.url) {
-                Logger.write("🎵 Воспроизводим: " + result.url);
-                
-                return new Promise((resolve) => {
-                    call.startPlayback(result.url, false);
-                    call.addEventListener(CallEvents.PlaybackFinished, () => {
-                        resolve();
-                    });
-                });
-            }
-        }
-        
-        throw new Error("TTS failed");
-        
-    } catch (error) {
-        Logger.write("❌ Ошибка TTS: " + error);
-        // Fallback на встроенный TTS
-        call.say(text, Language.RU_RUSSIAN_FEMALE);
-        return Promise.resolve();
-    }
-}
-
-// Запуск диалогового цикла
-function startConversation(call, context) {
-    Logger.write("👂 Слушаем пользователя...");
-    
-    // Запускаем запись с автоматическим распознаванием
-    call.record({
-        record_on_answer: false,
-        stereo: false,
-        max_duration: 15000,      // 15 секунд максимум
-        silence_timeout: 3000,    // 3 секунды тишины = конец фразы
-        transcribe: true,         // Включаем транскрипцию Voximplant
-        language: "ru-RU"
-    });
-    
-    // Обработка распознанной речи
-    call.addEventListener(CallEvents.RecordStopped, async (e) => {
-        Logger.write("🎤 Запись завершена");
-        
-        if (e.transcription && e.transcription.trim().length > 0) {
-            const userText = e.transcription.trim();
-            Logger.write("📝 Пользователь: " + userText);
-            
-            // Проверяем на команды завершения
-            if (isGoodbyeMessage(userText)) {
-                await speakToUser(call, "Спасибо за обращение! Всего доброго!");
-                setTimeout(() => call.hangup(), 2000);
-                return;
-            }
-            
-            // Получаем ответ от Groq
-            const aiResponse = await getGroqResponse(userText, context);
-            
-            if (aiResponse) {
-                // Говорим ответ
-                await speakToUser(call, aiResponse);
-                
-                // Продолжаем диалог
-                setTimeout(() => {
-                    startConversation(call, context);
-                }, 500);
-            } else {
-                // Ошибка AI - переспрашиваем
-                await speakToUser(call, "Извините, не расслышал. Повторите, пожалуйста?");
-                setTimeout(() => {
-                    startConversation(call, context);
-                }, 1000);
-            }
-            
-        } else {
-            Logger.write("⚠️ Речь не распознана");
-            await speakToUser(call, "Простите, плохо слышно. Говорите громче, пожалуйста.");
-            setTimeout(() => {
-                startConversation(call, context);
-            }, 1000);
-        }
-    });
-    
-    // Обработка ошибок записи
-    call.addEventListener(CallEvents.RecordFailed, async (e) => {
-        Logger.write("❌ Ошибка записи: " + e.reason);
-        await speakToUser(call, "Возникли технические проблемы. Попробуйте позвонить позже.");
-        call.hangup();
-    });
-}
-
-// Запрос к Groq LLM
-async function getGroqResponse(userMessage, context) {
-    Logger.write("🤖 Отправляем в Groq: " + userMessage);
-    
-    try {
-        // Добавляем сообщение пользователя в контекст
-        context.messages.push({
-            role: "user",
-            content: userMessage
-        });
-        
-        // Ограничиваем историю (последние 10 сообщений)
-        if (context.messages.length > 11) {
-            context.messages = [
-                context.messages[0], // Системное сообщение
-                ...context.messages.slice(-10)
-            ];
-        }
-        
-        const response = await Net.httpRequestAsync(CONFIG.GROQ_API, {
-            method: 'POST',
+            url: 'https://api.groq.com/openai/v1/chat/completions',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer ' + 'YOUR_GROQ_API_KEY' // Замените на ваш ключ
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
             },
-            postData: JSON.stringify({
-                model: CONFIG.GROQ_MODEL,
-                messages: context.messages,
-                max_tokens: 150,        // Короткие ответы
-                temperature: 0.7,      // Немного креативности
-                stream: false
-            }),
-            timeout: 10000
+            data: {
+                model: 'llama-3.1-8b-instant',
+                messages: messages,
+                max_tokens: 150,
+                temperature: 0.7
+            }
         });
         
-        Logger.write("📡 Ответ Groq (код): " + response.code);
-        
-        if (response.code === 200) {
-            const result = JSON.parse(response.text);
-            const aiMessage = result.choices[0].message.content.trim();
-            
-            // Добавляем ответ AI в контекст
-            context.messages.push({
-                role: "assistant",
-                content: aiMessage
-            });
-            
-            Logger.write("🤖 Groq ответил: " + aiMessage);
-            return aiMessage;
-            
-        } else {
-            Logger.write("❌ Ошибка Groq API: " + response.text);
-            return "Извините, возникла техническая проблема. Можете повторить вопрос?";
-        }
-        
+        res.json(response.data);
     } catch (error) {
-        Logger.write("❌ Ошибка при обращении к Groq: " + error);
-        return "Простите, сейчас есть проблемы с AI. Могу переключить на оператора?";
+        res.status(500).json({ error: error.message });
     }
-}
-
-// Проверка на фразы завершения
-function isGoodbyeMessage(text) {
-    const goodbyePhrases = [
-        'спасибо', 'пока', 'до свидания', 'всё', 'хватит', 
-        'конец', 'завершить', 'закончить', 'всего доброго'
-    ];
-    
-    const lowerText = text.toLowerCase();
-    return goodbyePhrases.some(phrase => lowerText.includes(phrase));
-}
-
-// Функция для переключения на оператора
-async function transferToOperator(call, reason = "по запросу") {
-    Logger.write("👥 Переключение на оператора: " + reason);
-    
-    await speakToUser(call, "Хорошо, переключаю вас на живого оператора. Один момент.");
-    
-    // Здесь код для перевода на оператора
-    // const operatorCall = VoxEngine.callSIP("operator@company.com");
-    // ... логика соединения
-    
-    // Пока просто информируем
-    await speakToUser(call, "К сожалению, все операторы заняты. Оставьте сообщение после сигнала.");
-}
-
-// Обработка ошибок
-VoxEngine.addEventListener(AppEvents.CallFailed, (e) => {
-    Logger.write("❌ Ошибка звонка: " + e.reason);
 });
 
-VoxEngine.addEventListener(AppEvents.Terminating, () => {
-    Logger.write("🔚 Завершение работы AI ассистента");
+app.listen(PORT, () => {
+    console.log(`TTS Proxy server running on port ${PORT}`);
+    console.log('Available providers:');
+    console.log('- Edge TTS (Microsoft) - FREE');
+    if (process.env.OPENAI_API_KEY) console.log('- OpenAI TTS');
+    if (process.env.ELEVEN_API_KEY) console.log('- ElevenLabs TTS');
 });
-
-// Логирование для отладки
-function debugLog(stage, data) {
-    Logger.write(`[DEBUG ${stage}] ${JSON.stringify(data)}`);
-}
